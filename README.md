@@ -11,12 +11,13 @@ ESP32S3 接收esp32c5 数据 通过串口发送数据到主控 https://github.co
 当前工程实现的主要功能如下：
 
 1. 初始化 NVS、UART1、WiFi STA 模式和 ESP-NOW。
-2. 通过 UART1 周期性向底层遥控器硬件发送 `0x66` 心跳/拉取字节。
-3. 从 UART1 RX 接收遥控器返回的原始数据流。
-4. 在串口数据流中查找固定 18 字节遥控器数据帧。
-5. 对数据帧做基础校验：长度为 18 字节，帧头为 `0xAA`，帧尾为 `0x55`。
-6. 解析按键、左右摇杆、拨轮、左右开关字段，并通过日志打印关键控制量。
-7. 将校验通过的完整 18 字节原始数据帧通过 ESP-NOW 发送给固定 MAC 的接收端。
+2. 从 UART1 RX 接收 STM32 遥控器主动发送的原始数据流。
+3. 在串口数据流中查找固定 18 字节遥控器数据帧。
+4. 对数据帧做基础校验：长度为 18 字节，帧头为 `0xAA`，帧尾为 `0x55`。
+5. 解析按键、左右摇杆、拨轮、左右开关字段，并通过日志打印关键控制量。
+6. 将校验通过的完整 18 字节原始数据帧通过 ESP-NOW 发送给固定 MAC 的接收端。
+7. ESP-NOW 提交发送成功后，通过 UART1 TX 向 STM32 回发 1 字节 ACK：`0x55`。
+8. 识别 STM32 可能输出的 3 字节控制帧 `AA A1 A2`，并通过 ESP-NOW 原样透传。
 
 ## 数据流
 
@@ -92,7 +93,7 @@ ESP32-S3 通过 UART1 与外部遥控器/采集板连接：
 | 波特率 | `115200` |
 | 数据格式 | 8 数据位，无校验，1 停止位 |
 | ESP32-S3 RX | GPIO4，接收遥控器数据 |
-| ESP32-S3 TX | GPIO5，向遥控器发送心跳/拉取字节 |
+| ESP32-S3 TX | GPIO5，向 STM32 回发 ACK |
 
 串口初始化在 `uart_init_remote()` 中完成：
 
@@ -103,14 +104,13 @@ ESP32-S3 通过 UART1 与外部遥控器/采集板连接：
 #define UART_TX_PIN    (5)
 ```
 
-程序启动后会创建 `uart_tx_task()`，每 100 ms 通过 UART1 发送一次 `0x66`：
+当前 STM32 端会主动按约 50 ms 周期发送主数据帧，并等待接收端 ACK。本工程不再周期性发送旧版 `0x66` 拉取字节，而是在成功接收并提交 ESP-NOW 发送 18 字节主数据帧后，通过 UART1 回发：
 
-```c
-#define TX_DATA (0x66)
-#define TX_INTERVAL_MS (100)
+```text
+0x55
 ```
 
-该字节用于保持或触发底层遥控器硬件输出数据。
+如果不回发这个 ACK，STM32 端会按 ACK 超时机制重发当前帧，链路上可能出现重复帧或帧率下降。
 
 ## ESP-NOW 配置
 
@@ -143,9 +143,18 @@ static const uint8_t dest_mac[6] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};
 5. 检查第 18 字节是否为 `0x55` 帧尾。
 6. 调用 `parse_remote_frame()` 解析字段并打印调试日志。
 7. 调用 `esp_now_send(dest_mac, buf, REMOTE_FRAME_LEN)` 发送原始 18 字节帧。
-8. 从缓存中移除已处理帧，继续查找下一帧。
+8. 如果 ESP-NOW 提交发送成功，调用 `uart_write_bytes()` 向 STM32 回发 `0x55` ACK。
+9. 从缓存中移除已处理帧，继续查找下一帧。
 
 如果缓存中出现错位数据，程序会逐字节滑动，直到重新找到合法帧头和帧尾。
+
+除 18 字节主数据帧外，程序也会识别 3 字节控制帧：
+
+```text
+AA A1 A2
+```
+
+识别到该控制帧时，程序会通过 ESP-NOW 发送 3 字节原始 payload。接收端如果需要使用重连/控制命令，也必须同步支持 `data_len == 3` 的分支。
 
 ## 启动流程
 
@@ -153,10 +162,9 @@ static const uint8_t dest_mac[6] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};
 
 1. 初始化 NVS。
 2. 初始化 UART1。
-3. 创建 `uart_tx_task()`，周期性发送 `0x66`。
-4. 初始化 WiFi STA，并锁定 Channel 3。
-5. 初始化 ESP-NOW，并添加目标接收端 peer。
-6. 进入 `forward_loop()`，持续执行串口接收和 ESP-NOW 发送。
+3. 初始化 WiFi STA，并锁定 Channel 3。
+4. 初始化 ESP-NOW，并添加目标接收端 peer。
+5. 进入 `forward_loop()`，持续执行串口接收、ESP-NOW 发送和 UART ACK 回发。
 
 如果将 `UART_ONLY_TEST` 改为 `1`，程序会只执行串口收帧测试，不初始化 ESP-NOW，也不会向接收端发送数据：
 
@@ -181,7 +189,7 @@ idf.py -p PORT flash monitor
 
 ```text
 UART ready (TX=5 RX=4 baud=115200)
-UART TX task started, sending 0x66 every 100 ms
+UART ACK mode enabled: reply 0x55 after valid remote frames
 WiFi hardware init done. Channel locked to 3
 ESP-NOW init done. Peer added.
 ESP-NOW forward task loop started
@@ -190,7 +198,7 @@ ESP-NOW forward task loop started
 收到合法遥控器帧后，会打印解析结果并发送 ESP-NOW：
 
 ```text
-ESP-NOW TX msg: frame=1 KEY=00000000 L(X:0, Y:0) R(X:0, Y:0) switch_left=0 switch_right=0
+ESP-NOW TX msg: frame=1 KEY=00000000 L(X:0, Y:0) R(X:0, Y:0) dial=0 switch_left=0 switch_right=0
 ```
 
 ## 关键源码位置
@@ -207,4 +215,4 @@ ESP-NOW TX msg: frame=1 KEY=00000000 L(X:0, Y:0) R(X:0, Y:0) switch_left=0 switc
 3. ESP-NOW 发送端和接收端必须锁定在 Channel 3。
 4. `dest_mac` 必须填写接收端 ESP32-S3 的 STA MAC 地址。
 5. 当前 ESP-NOW 未启用加密，适合调试和短链路控制验证。
-6. 代码中 `uart_tx_task()` 会持续发送 `0x66`，如果后续遥控器硬件不需要拉取字节，需要同步调整该任务。
+6. 接收端如果只接受 18 字节 payload，会丢弃 `AA A1 A2` 控制帧；如果需要重连/控制命令，需要同步增加 3 字节控制帧处理。

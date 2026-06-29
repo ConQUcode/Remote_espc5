@@ -1,6 +1,7 @@
 /*  WiFi ESP-NOW Remote Example */
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/param.h>
@@ -32,9 +33,10 @@ static const uint8_t dest_mac[6] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};
 #define FRAME_HEADER (0xAA)
 #define FRAME_FOOTER (0x55)
 #define REMOTE_FRAME_LEN (18)
-
-#define TX_DATA (0x66)           // 要发送的数据
-#define TX_INTERVAL_MS (100) 
+#define REMOTE_ACK (0x55)
+#define CONTROL_FRAME_LEN (3)
+#define CONTROL_FRAME_BYTE1 (0xA1)
+#define CONTROL_FRAME_BYTE2 (0xA2)
 
 typedef struct __attribute__((packed)) {
     uint8_t header;
@@ -134,29 +136,24 @@ static esp_err_t uart_init_remote(void)
     return ESP_OK;
 }
 
-// 测试串口发送心跳
-static void uart_tx_task(void *arg)
+static void send_remote_ack(void)
 {
-    const uint8_t tx_byte = TX_DATA;
-    static uint32_t send_count = 0;
-    
-    ESP_LOGI(TAG, "UART TX task started, sending 0x%02X every %d ms", TX_DATA, TX_INTERVAL_MS);
-    
-    for (;;) {
-        int bytes_written = uart_write_bytes(UART_PORT, &tx_byte, 1);
-        if (bytes_written == 1) {
-            send_count++;
-            if (send_count % 100 == 0) {
-                // ESP_LOGI(TAG, "Sent 0x%02X %lu times", tx_byte, send_count);
-            }
-        } else {
-            ESP_LOGW(TAG, "UART write failed: %d bytes written", bytes_written);
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
+    const uint8_t ack = REMOTE_ACK;
+    int bytes_written = uart_write_bytes(UART_PORT, &ack, 1);
+    if (bytes_written != 1) {
+        ESP_LOGW(TAG, "UART ACK write failed: %d bytes written", bytes_written);
     }
 }
 
+static bool is_control_frame(const uint8_t *buf, size_t buf_len)
+{
+    return buf_len >= CONTROL_FRAME_LEN &&
+           buf[0] == FRAME_HEADER &&
+           buf[1] == CONTROL_FRAME_BYTE1 &&
+           buf[2] == CONTROL_FRAME_BYTE2;
+}
+
+#if UART_ONLY_TEST
 static void uart_only_loop(void)
 {
     uint32_t frame_cnt = 0;
@@ -173,13 +170,22 @@ static void uart_only_loop(void)
         memcpy(&buf[buf_len], in, copy_n);
         buf_len += copy_n;
 
-        while (buf_len >= REMOTE_FRAME_LEN) {
+        while (buf_len >= CONTROL_FRAME_LEN) {
             size_t i = 0;
             while (i < buf_len && buf[i] != FRAME_HEADER) i++;
 
             if (i > 0) {
                 memmove(buf, &buf[i], buf_len - i);
                 buf_len -= i;
+            }
+
+            if (buf_len < CONTROL_FRAME_LEN) break;
+
+            if (is_control_frame(buf, buf_len)) {
+                ESP_LOGI(TAG, "control frame UART Received: AA A1 A2");
+                memmove(buf, &buf[CONTROL_FRAME_LEN], buf_len - CONTROL_FRAME_LEN);
+                buf_len -= CONTROL_FRAME_LEN;
+                continue;
             }
 
             if (buf_len < REMOTE_FRAME_LEN) break;
@@ -194,12 +200,14 @@ static void uart_only_loop(void)
             frame_cnt++;
 
             ESP_LOGI(TAG, "frame=%lu UART Received", (unsigned long)frame_cnt);
+            send_remote_ack();
 
             memmove(buf, &buf[REMOTE_FRAME_LEN], buf_len - REMOTE_FRAME_LEN);
             buf_len -= REMOTE_FRAME_LEN;
         }
     }
 }
+#endif
 
 static void forward_loop(void)
 {
@@ -221,13 +229,27 @@ static void forward_loop(void)
         buf_len += copy_n;
 
         // 核心拆包寻帧逻辑 (原有)
-        while (buf_len >= REMOTE_FRAME_LEN) {
+        while (buf_len >= CONTROL_FRAME_LEN) {
             size_t i = 0;
             while (i < buf_len && buf[i] != FRAME_HEADER) i++;
 
             if (i > 0) {
                 memmove(buf, &buf[i], buf_len - i);
                 buf_len -= i;
+            }
+
+            if (buf_len < CONTROL_FRAME_LEN) break;
+
+            if (is_control_frame(buf, buf_len)) {
+                ESP_LOGI(TAG, "ESP-NOW TX control: AA A1 A2");
+                esp_err_t err = esp_now_send(dest_mac, buf, CONTROL_FRAME_LEN);
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "esp_now_send(control) failed: error=%d", err);
+                }
+
+                memmove(buf, &buf[CONTROL_FRAME_LEN], buf_len - CONTROL_FRAME_LEN);
+                buf_len -= CONTROL_FRAME_LEN;
+                continue;
             }
 
             if (buf_len < REMOTE_FRAME_LEN) break;
@@ -244,11 +266,12 @@ static void forward_loop(void)
             // 调试打印控制台
             ESP_LOGI(TAG,
                      "ESP-NOW TX msg: frame=%lu KEY=%02X%02X%02X%02X "
-                     "L(X:%d, Y:%d) R(X:%d, Y:%d) switch_left=%u switch_right=%u",
+                     "L(X:%d, Y:%d) R(X:%d, Y:%d) dial=%d switch_left=%u switch_right=%u",
                      (unsigned long)frame_cnt,
                      frame.KEY[0], frame.KEY[1], frame.KEY[2], frame.KEY[3],
                      (int)frame.rocker_l_, (int)frame.rocker_l1,
                      (int)frame.rocker_r_, (int)frame.rocker_r1,
+                     (int)frame.dial,
                      (unsigned int)frame.switch_left,
                      (unsigned int)frame.switch_right);
 
@@ -256,6 +279,8 @@ static void forward_loop(void)
             esp_err_t err = esp_now_send(dest_mac, buf, REMOTE_FRAME_LEN);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "esp_now_send() failed: error=%d", err);
+            } else {
+                send_remote_ack();
             }
 
             // 处理完滑走本帧数据
@@ -272,9 +297,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(uart_init_remote());
     ESP_LOGI(TAG, "UART ready (TX=%d RX=%d baud=%d)", UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
-
-    // 依然保留了不断向底层手柄硬件发送心跳拉取数据的 Task
-    xTaskCreate(uart_tx_task, "uart_tx", 2048, NULL, 5, NULL);
+    ESP_LOGI(TAG, "UART ACK mode enabled: reply 0x%02X after valid remote frames", REMOTE_ACK);
     
 #if UART_ONLY_TEST
     uart_only_loop();

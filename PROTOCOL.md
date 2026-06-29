@@ -28,7 +28,7 @@ esp_wifi_set_channel(3, WIFI_SECOND_CHAN_NONE);
 
 ## 3. 通信数据帧协议 (UART & RF Payload)
 
-发送端与接收端之间传输的有效载荷（Payload）长度为 **18 字节**，格式严格对齐。
+发送端与接收端之间传输的主要有效载荷（Payload）长度为 **18 字节**，格式严格对齐。当前发送端也会透传 3 字节控制帧 `AA A1 A2`，接收端需要按 payload 长度区分处理。
 
 ### 3.1 帧结构定义
 每帧数据以单字节 `0xAA` 开头，以单字节 `0x55` 结尾。
@@ -55,6 +55,26 @@ static inline int16_t be16_to_i16(const uint8_t *p) {
 }
 ```
 
+### 3.3 控制帧
+
+STM32 端可能通过同一 UART 链路输出 3 字节控制帧：
+
+```text
+AA A1 A2
+```
+
+本发送端会识别该控制帧，并通过 ESP-NOW 原样发送 3 字节 payload。该帧不是 18 字节遥控器主数据帧，接收端不能只用 `data_len == 18` 一个分支，否则会丢弃控制命令。
+
+### 3.4 UART ACK 说明
+
+STM32 遥控器端发送 18 字节主数据帧后会等待 1 字节 ACK。本发送端在收到合法主数据帧并成功提交 ESP-NOW 发送后，会通过 UART1 TX 回发：
+
+```text
+0x55
+```
+
+这个 ACK 只存在于 STM32 与本发送端之间，不会作为 ESP-NOW payload 发给接收端。
+
 ---
 
 ## 4. 接收端开发建议步骤
@@ -68,6 +88,11 @@ static inline int16_t be16_to_i16(const uint8_t *p) {
     void recv_cb(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
         if (data_len == 18 && data[0] == 0xAA && data[17] == 0x55) {
             // 校验通过，解析摇杆和按键数据...
+        } else if (data_len == 3 &&
+                   data[0] == 0xAA &&
+                   data[1] == 0xA1 &&
+                   data[2] == 0xA2) {
+            // 控制/重连命令...
         }
     }
     ```
